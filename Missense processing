@@ -1,0 +1,249 @@
+```{r}
+
+if (!requireNamespace("httr", quietly = TRUE)) install.packages("httr")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr")
+
+library(httr)
+library(dplyr)
+library(purrr)
+library(UniProt.ws)
+
+data <- read.csv("mutation.csv")
+
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+
+
+# Definimos tres funciones: la primera para obtener la secuencia peptídica nativa a través del nombre del gen ('hugo_symbol') accediendo a UniProt para ello; la segunda para generar la secuencia mutada indicando la mutación deseada ('aa_change_short'); la tercera para producir la secuencia peptídica de 17 aminoácidos en la que el aminoácido mutado esté en la posición central:
+
+# PRIMERA FUNCIÓN: obtener la secuencia nativa desde UniProt:
+get_protein_sequence_uniprot <- function(gene_name) {
+  # Establecemos la URL base de la API de búsqueda de UniProt
+  base_url <- "https://rest.uniprot.org/uniprotkb/search?query="
+  # Establecemos el parámetro de consulta (query) que especifica el nombre exacto del gen utilizando gene_exact: seguido del gene_name proporcionado como argumento, y restringimos los resultados alorganismo humano con s id que es 9606.
+  query <- paste0("gene_exact:", gene_name, " AND organism_id:9606")
+  # Especificamos el formato en el que queremos el resultados que es FASTA
+  format <- "&format=fasta"
+  # Aseguramos que cualquier carácter especial en la consulta se maneje correctamente según las reglas de codificación de URL
+  encoded_query <- URLencode(query)
+  url <- paste0(base_url, encoded_query, format)
+  # Utilizamos la función GET del paquete httr para realizar una solicitud HTTP GET a la URL construida. Esta línea envía la solicitud a UniProt y almacena la respuesta en la variable response.
+  response <- httr::GET(url)
+  # Verificamos si el código de estado de la respuesta HTTP es 200
+  if(response$status_code == 200) {
+    # Extraemos el contenido de la respuesta como texto
+    content <- httr::content(response, "text")
+    # Dividimos el contenido de la respuesta en líneas, creando un vector donde cada elemento es una línea del contenido
+    sequence_lines <- unlist(strsplit(content, "\n"))
+    # Eliminamos el primer elemento del vector sequence_lines, que corresponde al encabezado del formato FASTA
+    sequence_lines <- sequence_lines[-1]
+    # Combinamos todas las líneas de la secuencia en una sola cadena de texto
+    sequence <- paste0(sequence_lines, collapse = "")
+    return(sequence)
+  } else {
+    # Solicitamos que devuelva NA en caso de no haberse podido obtener ninguna secuencia
+    return(NA)
+  }
+}
+
+
+# SEGUNDA FUNCIÓN PARA GENERAR LA SECUENCIA MUTADA:
+apply_mutation <- function(sequence, mutation) {
+  # Utilizamos expresiones regulares para descomponer la cadena de mutation en sus componentes: el aminoácido original ([A-Z] antes del número), la posición de la mutación ([0-9]+), y el nuevo aminoácido ([A-Z] después del número). La función regexec encuentra la posición de esta coincidencia en mutation, y regmatches extrae la subcadena correspondiente.
+  matches <- regmatches(mutation, regexec("p\\.([A-Z])([0-9]+)([A-Z])", mutation))
+  # Verificamos que el resultado de la descomposición contenga 4 elementos: el texto completo de la coincidencia y los tres grupos capturados (aminoácido original, posición, aminoácido mutado)
+  if (length(matches[[1]]) == 4) {
+    # Extraemos los componentes individuales de la mutación del resultado de las expresiones regulares: el aminoácido original, la posición de la mutación en la secuencia de la proteína, y el aminoácido mutado.
+    original_aa <- matches[[1]][2]
+    position <- as.integer(matches[[1]][3])
+    mutated_aa <- matches[[1]][4]
+    # Comprobamos si la longitud de la secuencia de la proteína es suficientemente larga como para contener la posición de la mutación especificada
+    if (nchar(sequence) >= position) {
+      # Dividimos la secuencia de la proteína en una lista de aminoácidos individuales para facilitar la modificación de la secuencia en el punto específico de la mutación
+      seq_list <- unlist(strsplit(sequence, ""))
+      # Aseguramos que el aminoácido nativo coincide con la secuencia original obtenida desde UniProt para evitar generar secuencias erróneas por isoformas no coincidentes
+      if (seq_list[position] != original_aa) {
+        return('native aminoacid position not matched')
+      }
+      # Reemplazamos el aminoácido en la posición especificada por la mutación con el nuevo aminoácido
+      seq_list[position] <- mutated_aa
+      # Recombinamos de nuevo la lista de aminoácidos modificada en una cadena de texto única y obtenemos esta secuencia mutada como resultado de la función
+      return(paste(seq_list, collapse = ""))
+    }
+  }
+  # Solicitamos que devuelva NA en caso de no haberse podido obtener ninguna secuencia
+  return(NA)
+}
+
+
+
+# TERCERA FUNCIÓN PARA OBTENER LA SECUENCIA PEPTÍDICA DE 17 AMINOÁCIDOS CON EL AA MUTADO EN POSICIÓN CENTRAL:
+extract_17_mer <- function(sequence, mutation) {
+  # Extraemos la posición numérica de la mutación dentro de la secuencia de la proteína. La función sub busca el patrón p.[A-Z]([0-9]+)[A-Z] en mutation, donde [A-Z] representa un aminoácido y ([0-9]+) la posición de la mutación, y reemplaza toda la cadena de mutación por solo el grupo capturado ([0-9]+), que es la posición. Luego, as.integer convierte esta posición a un número entero
+  position <- as.integer(sub("p\\.[A-Z]([0-9]+)[A-Z]", "\\1", mutation))
+  # Calculamos la posición inicial de la subsecuencia de 17 aminoácidos para extraer. Restamos 8 a la posición de la mutación para comenzar la subsecuencia de 8 aminoácidos antes de la mutación. La función max asegura que esta posición inicial no sea menor que 1, lo cual podría suceder si la mutación está cerca del comienzo de la secuencia
+  start_pos <- max(position - 8, 1)
+  # Calculamos la posición final de la subsecuencia de 17 aminoácidos. Sumamos 8 a la posición de la mutación para terminar la subsecuencia de 8 aminoácidos después de la mutación. La función min asegura que esta posición final no exceda la longitud total de la secuencia (nchar(sequence)), lo cual podría suceder si la mutación está cerca del final de la secuencia
+  end_pos <- min(position + 8, nchar(sequence))
+  # Extraemos la subsecuencia de la secuencia principal, comenzando en start_pos y terminando en end_pos, y obtenemos esta subsecuencia.
+  return(substr(sequence, start_pos, end_pos))
+}
+
+
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+
+
+# Realizamos una prueba de gen en gen con los primeros cuatro genes:
+
+# TYRO3 - p.G689C
+sequence <- get_protein_sequence_uniprot("TYRO3") # Obtenemos la secuencia
+mutation <- "p.G689C" # Declaramos la mutación
+mutated_sequence <- apply_mutation(sequence, mutation) # Aplicamos la mutación
+computed_mer_17 <- extract_17_mer(mutated_sequence, mutation) # Obtenemos la secuencia de interés
+correct_mer_17 <- 'YSGDYYRQCCASKLPVK' # Representa la secuencia realizada a mano para verificar que la secuencia obtenida (computed_mer_17) coincide con la calculada
+print(computed_mer_17)
+print(correct_mer_17)
+
+# C1orf94 - p.L97V
+sequence <- get_protein_sequence_uniprot("C1orf94")
+mutation <- "p.L97V"
+mutated_sequence <- apply_mutation(sequence, mutation)
+computed_mer_17 <- extract_17_mer(mutated_sequence, mutation)
+correct_mer_17 <- 'LSVPVVGTVRGNELSFQ'
+print(computed_mer_17)
+print(correct_mer_17)
+
+# ZBBX - p.D699E
+sequence <- get_protein_sequence_uniprot("ZBBX")
+mutation <- "p.D699E"
+mutated_sequence <- apply_mutation(sequence, mutation)
+computed_mer_17 <- extract_17_mer(mutated_sequence, mutation)
+correct_mer_17 <- 'DTTDQHTLENLEKELQV'
+print(computed_mer_17)
+print(correct_mer_17)
+
+# POTEJ - p.I643N
+sequence <- get_protein_sequence_uniprot("POTEJ")
+mutation <- "p.I643N"
+mutated_sequence <- apply_mutation(sequence, mutation)
+computed_mer_17 <- extract_17_mer(mutated_sequence, mutation)
+correct_mer_17 <- 'RKKKYLEDNESVKKKND'
+print(computed_mer_17)
+print(correct_mer_17)
+
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+
+
+# Ahora realizaremos un script para acceder a los datos de nuestra base de datos con mutaciones donde el nombre del gen sea 'hugo_symbol' y la mutación declarada sea 'aa_change_short' para procesar los datos fila a fila:
+
+# FUNCIÓN PARA EL PROCESAMIENTO DE DATOS DE UNA FILA DE NUESTRA BASE DE DATOS:
+process_gene_mutation <- function(hugo_symbol, aa_change_short) {
+  sequence <- get_protein_sequence_uniprot(hugo_symbol)
+  if (is.na(sequence)) {
+    return(NA)
+  }
+  
+  mutated_sequence <- apply_mutation(sequence, aa_change_short)
+  if (is.na(mutated_sequence)) {
+    # Devuelve NA si no se puede realizar el cambio (no acceso a secuencia o error)
+    return(NA)  
+  }
+  
+  mer_17 <- extract_17_mer(mutated_sequence, aa_change_short)
+  return(mer_17)
+}
+
+# Ahora iteramos la función por cada fila para obtener las secuencias:
+data_with_mer_17 <- data %>%
+  #mutate(mer_17 = map2_chr(hugo_symbol, aa_change_short, process_gene_mutation))
+
+View(data_with_mer_17)
+
+# Extraemos los datos a una base que guardaremos como un nuevo archivo csv llamado 'mers.csv':
+mers <- data_with_mer_17 %>%
+  select(patient_id, sample_id, hugo_symbol, aa_change_short, mer_17)
+
+mers <- mers %>%
+  mutate(mer_17 = ifelse(mer_17 == "", "//native aa not matched//", mer_17))
+
+write.csv(mers, "mers.csv", row.names = FALSE)
+
+View(mers)
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+
+# PARA REALIZAR ESTADÍSTICAS BÁSICAS DE PÉRDIDA DE SECUENCIAS POR NA, ISOFORMAS Y MUT. DE EXTREMO:
+
+# Contamos el número de secuencias no obtenidas (NA):
+sum(is.na(mers$mer_17))
+
+# Contamos el número de secuencias perdidas por isoforma / aa no coincidentes:
+sum(grepl("//native aa not matched//", mers$mer_17, fixed = TRUE))
+
+# Contamos el número de secuencias mers <17 aminoácidos por presentar mutación en inicio/final de la secuencia:
+sum(grepl(">", mers$mer_17, fixed = TRUE))
+
+# Comprobación de corrección mediante el chequeo manual de 4 genes seleccionados al azar:
+if(nrow(mers) >= 4) {
+  random_entries <- sample(mers$hugo_symbol, 4)
+} else {
+  random_entries <- sample(mers$hugo_symbol, nrow(mers))
+}
+
+print(random_entries)
+
+rows <- filter(mers, hugo_symbol == "TET2")
+print(rows)
+rows <- filter(mers, hugo_symbol == "APC")
+print(rows)
+rows <- filter(mers, hugo_symbol == "H3F3A")
+print(rows)
+rows <- filter(mers, hugo_symbol == "TP53")
+print(rows)
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+
+# FUNCIÓN PARA GENERAR EL ARCHIVO .TXT EN FORMATO FASTA DE MUTACIONES MISSENSE:
+library(tidyverse)
+
+setwd("C:your directory")
+df <- read_csv("mers.csv")
+View(df)
+
+# Eliminamos las filas donde el valor en la columna 'mer_17' es NA:
+df <- drop_na(df, mer_17)
+
+# Modificamos los strings en la columna 'mer_17' que contienen ">" eliminando todo lo que sigue después de ">" para seleccionar solo aquellos caracteres que representan los aminoácidos de las secuencias que pertenecen a mutaciones de extremo:
+df$mer_17 <- str_replace(df$mer_17, ">.*", "")
+
+# Filtramos las filas para conservar solo aquellas con valores válidos de 'mer_17' que deben ser secuencias de aminoácidos en mayúsculas (quitamos así cualquier celda que contenga caracteres en minúscula que solo aparecen en mensajes como "//aa native not matched//"):
+df <- df %>% 
+  filter(str_detect(mer_17, "^[A-Z]+$"))
+
+
+# Definimos una función para crear una entrada en formato FASTA por cada fila que contenga un "header" que comience por > sequido de la concateneación de variables de identificación (patient_id, sample_id, hugo_symbol, aa_change_short):
+create_fasta_entry <- function(patient_id, sample_id, hugo_symbol, aa_change_short, mer_17) {
+  # Eliminamos la notación 'p.' del cambio de aminoácido
+  mutation = gsub("p\\.", "", aa_change_short)
+  # Creamos el encabezado del archivo FASTA:
+  header <- paste0(">", patient_id, "_", sample_id, "_", hugo_symbol, "_", mutation)
+  # Obtenemos el encabezado y la secuencia en dos líneas separadas
+  return(c(header, mer_17))
+}
+
+# Iteramos la función a cada fila del dataframe y unimos las entradas en una única cadena de texto:
+fasta_entries <- pmap(df, create_fasta_entry) %>% 
+  unlist() %>% 
+  paste(collapse = "\n")
+
+# Guardamos las entradas FASTA en un archivo de texto:
+write_file(fasta_entries, "missense.txt")
+```
