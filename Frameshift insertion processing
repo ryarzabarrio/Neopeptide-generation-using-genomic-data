@@ -1,0 +1,414 @@
+```{r}
+
+library(dplyr)
+library(purrr)
+library(Biostrings)
+library(GenomicFeatures)
+library(rtracklayer)
+library(biomaRt)
+
+setwd("your directory")
+
+df <- read.csv("mutations.csv")
+
+# Excluimos aquellas entradas con missing values en nuestras variables clave para el script:
+df <- df %>%
+  filter(!is.na(HGVSc_transformed) & !is.na(transcript_id) & !is.na(aa_change_short))
+
+
+View(df)
+
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# CREAREMOS EL PIPELINE PARA PROCESAR LOS DATOS DE LAS MUTACIONES. 
+# Las mutaciones frameshift_ins tienen dos formas de expresarse; DUPLICACIONES O INSERCIONES 
+  # DUPLICACIÓN: Duplicación puntual: estructura c.111dup == significa una duplicación de una única base que es la que se encuentra en la posición 111
+  # DUPLICACIÓN: Duplicación de rango: estructura c.111_114dup == significa una duplicación de una secuencia de bases que es la que se encuentra entre las posiciones 111 a 114 incluidos.
+  # DUPLICACIÓN: Duplicación específica: estructura c.320dupG == se especifica que se duplica una guanina (G) en la posición 320. 
+  # INSERCIÓN: Inserción específica única: estructura c.3306_3307insA == especifica que se debe insertar una adenina (A) entre las posiciones 3306 y 3307 de la secuencia. 
+  # INSERCIÓN: Inserción específica múltiple: estructura c.388_389insTC == especifica que se debe insertar un doblete timina-citosina (TC) entre las posiciones 388 y 389 de la secuencia.
+
+# Por tanto, para generar este script emplearemos una función que devuelva la secuencia de DNA codificante según el transcript_id del gen. Posteriormente tendremos que definir una función que procese las mutaciones de tipo DUPLICACIÓN y otra función que procese las INSERCIONES. La siguiente función deberá aplicar la mutación adecuada en función de si la entrada es una mutación de tipo duplicación o inserción. La siguiente función traducirá la secuencia mutada obtenida (para cualquier caso, ya sea duplicación o inserción). La última función separará la secuencia final en secuencia no mutada y mutada, como en el script preparado para las mutaciones frameshift_del.
+  
+
+
+# PRIMERA FUNCIÓN PARA OBTENER LA SECUENCIA DE DNA CODIFICANTE DESDE ENSEMBL EMPLEANDO LA VARIABLE transcript_id::
+get_coding_sequence_from_ensembl <- function(transcript_id) {
+  # Establecemos conexión con la base de datos de Ensembl para humanos usando biomaRt:
+  ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://useast.ensembl.org")
+  # Obtienmos la secuencia de codificante para el transcript_id especificado:
+  sequence <- getSequence(id = transcript_id, type = "ensembl_transcript_id",
+                          seqType = "coding", mart = ensembl)
+  # La función devuelve la secuencia en formato DNAStringque necesitaremos para manipularlo y traducirlo posteriormente:
+  return(DNAString(sequence$coding))
+}
+
+# SEGUNDA FUNCIÓN PARA APLICAR MUTACIONES DE TIPO DUPLICACIÓN EN LA SECUENCIA CODIFICANTE OBTENIDA BASÁNDONOS EN LA ANOTACIÓN DE HGVSc.
+apply_duplication <- function(coding_sequence, hgvsc_transformed) {
+  # Chequeamos si la mutación es de tipo duplicación:
+  if (grepl("dup", hgvsc_transformed)) {
+    duplicated_sequence <- ""
+    # Chequemos si la mutación duplicación es de tipo rango (c.X_Ydup) (si no, será una duplicación puntual):
+    if (grepl("_", hgvsc_transformed)) {
+      matches <- regmatches(hgvsc_transformed, regexec("c.([0-9]+)_([0-9]+)dup", hgvsc_transformed))
+      # Extrae las posiciones de inicio y fin de la duplicación y las convierte a numéricas
+      start_pos <- as.numeric(matches[[1]][2])
+      end_pos <- as.numeric(matches[[1]][3])
+      # Extrae la secuencia que será duplicada usando las posiciones obtenidas
+      duplicated_sequence <- substr(coding_sequence, start_pos, end_pos)
+    } else {
+      # Para aquellos casos de duplicación puntual (c.Xdup):
+      matches <- regmatches(hgvsc_transformed, regexec("c.([0-9]+)dup", hgvsc_transformed))
+      # Extrae la posición de inicio de la duplicación y la usa como posición final también
+      start_pos <- as.numeric(matches[[1]][2])
+      end_pos <- start_pos
+      # Extrae el nucleótido que será duplicado
+      duplicated_sequence <- substr(coding_sequence, start_pos, end_pos)
+    }
+    
+    # Aplica la duplicación
+    mutated_sequence <- DNAString(paste0(
+      # Secuencia original hasta el punto de duplicación:
+      substr(coding_sequence, 1, end_pos),
+      # Seguido de secuencia duplicada:
+      duplicated_sequence,
+      # Seguido de resto de la secuencia original después del punto de duplicación
+      substr(coding_sequence, end_pos + 1, nchar(coding_sequence))
+    ))
+  } else {
+    # Devuelve la secuencia original si no se detecta un patrón de duplicación
+    mutated_sequence <- coding_sequence
+  }
+  
+  return(mutated_sequence)
+}
+
+# TERCERA FUNCIÓN PARA APLICAR MUTACIONES DE TIPO INSERCIÓN EN LA SECUENCIA CODIFICANTE OBTENIDA BASÁNDONOS EN LA ANOTACIÓN DE HGVSc.
+apply_insertion <- function(coding_sequence, hgvsc_transformed) {
+  # Convertimos la secuencia codificante en una cadena de caracteres para su manipulación
+  coding_sequence <- as.character(coding_sequence)
+  # Buscamos coincidencias para el patrón de inserción (es decir, que contenga "ins", la localización entre las bases que se realizará la inserción y la/las bases de nucleótidos que se insertarán):
+  matches <- regmatches(hgvsc_transformed, regexec("c\\.([0-9]+)_?([0-9]+)?ins([A-Z]+)", hgvsc_transformed))
+  if (length(matches) > 0 && length(matches[[1]]) >= 4) {
+    # Extraemos las partes relevantes de la coincidencia:
+    # La posición
+    start_pos <- as.numeric(matches[[1]][2])
+    # El/los nucleótidos que se insertarán:
+    inserted_sequence <- matches[[1]][4]
+    # Construimos la nueva secuencia con la inserción después de la posición de la mutación:
+    mutated_sequence <- DNAString(paste0(
+      # Primero incluimos hasta la posición de la mutación (incluyendo dicha posición):
+      substr(coding_sequence, 1, start_pos),
+      # Luego el/los nucleótidos que se deben insertar:
+      inserted_sequence,
+      # Finalmente el resto de la secuencia:
+      substr(coding_sequence, start_pos + 1, nchar(coding_sequence))  
+    ))
+  } else {
+    # No hay cambios si el patrón no coincide o si falla el análisis
+    mutated_sequence <- DNAString(coding_sequence)
+  }
+  
+  return(mutated_sequence)
+}
+
+# LA CUARTA FUNCIÓN APLICARÁ LA MUTACIÓN (DUPLICACIÓN O INSERACIÓN SEGÚN EL PATRÓN DE LA MUTACIÓN EN HGVSc_tranformed):
+apply_mutation <- function(coding_sequence, hgvsc_transformed) {
+  # Si la mutación es DUPLICACIÓN:
+  if (grepl("dup", hgvsc_transformed)) {
+    # Entonces aplicaremos una duplicación:
+    return(apply_duplication(coding_sequence, hgvsc_transformed))
+  }
+  # Si no, y si la mutación es de tipo inserción:
+  else if (grepl("ins", hgvsc_transformed)) {
+    # Entonces aplicará la inserción:
+    return(apply_insertion(coding_sequence, hgvsc_transformed))
+  }
+  else {
+    # En caso de que la mutación no sea de ninguno de los tipos devolverá la secuencia original.
+    return(coding_sequence)
+  }
+}
+
+# LA QUINTA FUNCIÓN TRADUCIRÁ LA SECUENCIA CODIFICANTE MUTADA A SU PROTEÍNA CORRESPONDIENTE MEDIANTE LA FUNCIÓN translate():
+translate_to_amino_acids <- function(dna_sequence) {
+  return(as.character(translate(dna_sequence)))
+}
+
+# LA SEXTA FUNCIÓN SEPARARÁ LA PARTE NO MUTADA DE LA SECUENCIA MUTADA QUE COMENZARÁ EN LA POSICIÓN DE LA MUTACIÓN (la consecuencia en la secuencia de la proteína entre una mutación framshift_del e ins es la misma, genera el cambio de un aminoácido seguido de una secuencia de aminoácidos truncados, por tanto esta función es igual que la empleada para las de tipo delección a la hora de generar las subsecuencias):
+split_sequence <- function(amino_acid_sequence, aa_change_short) {
+  # Extraemos la posición de la mutación y la longitud hasta el codón de parada desde la notación del cambio de aminoácido; por ejemplo para p.X123Yfs*45, 123 es la posición de la mutación y 45 es la longitud hasta el codón de parada:
+  matches <- regmatches(aa_change_short, regexec("p.\\D(\\d+).*fs\\*(\\d+)", aa_change_short))
+  mutation_position <- as.numeric(matches[[1]][2])
+  length_until_stop <- as.numeric(matches[[1]][3])
+  # Calculamos la posición final de la parte de la secuencia mutada:
+  end_position_mutated <- mutation_position + length_until_stop - 1
+  # Divide la secuencia en parte no mutada y parte mutada, según las posiciones calculadas. La no mutada será desde el aminoácido nativo en posición 1 hasta [posición de la mutación -1]:
+  unmutated_sequence <- substring(amino_acid_sequence, 1, mutation_position - 1)
+  mutated_sequence_fragment <- ifelse(nchar(amino_acid_sequence) >= end_position_mutated, 
+                                      substring(amino_acid_sequence, mutation_position, end_position_mutated), 
+                                      substring(amino_acid_sequence, mutation_position))
+  # La función devuelve una lista con las partes mutada y no mutada de la secuencia calculadas previamente:
+  list(unmutated = unmutated_sequence, mutated = mutated_sequence_fragment)
+}
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# CHEQUEO DE LAS FUNCIONES CON EJEMPLOS PREVIO PROCESAMIENTO DE LA BASE DE DATOS:
+# Declaramos la información necesaria para las funciones definidas (transcript_id, HGVSc_transformed y aa_change_short):
+
+# Para estructura tipo c.Xdup
+transcript_id <- "ENST00000536324"  
+hgvsc_transformed <- "c.1195dup" 
+aa_change_short <- "p.E399Gfs*26"
+coding_sequence <- get_coding_sequence_from_ensembl(transcript_id)
+mutated_coding_sequence <- apply_mutation(coding_sequence, hgvsc_transformed)
+amino_acid_sequence <- translate_to_amino_acids(mutated_coding_sequence)
+result <- split_sequence(amino_acid_sequence, aa_change_short)
+print(amino_acid_sequence)
+print(paste("Unmutated sequence:", result$unmutated))
+print(paste("Mutated sequence fragment:", result$mutated))
+
+# Para estructura tipo c.X_Ydup
+transcript_id <- "ENST00000408937"  
+hgvsc_transformed <- "c.914_923dup"  
+aa_change_short <- "p.I309Rfs*5"
+coding_sequence <- get_coding_sequence_from_ensembl(transcript_id)
+mutated_coding_sequence <- apply_mutation(coding_sequence, hgvsc_transformed)
+amino_acid_sequence <- translate_to_amino_acids(mutated_coding_sequence)
+result <- split_sequence(amino_acid_sequence, aa_change_short)
+print(amino_acid_sequence)
+print(paste("Unmutated sequence:", result$unmutated))
+print(paste("Mutated sequence fragment:", result$mutated))
+
+# Para estructura tipo c.Xdup(nucl):
+transcript_id <- "ENST00000282388"  
+hgvsc_transformed <- "c.320dupG" 
+aa_change_short <- "p.G108Rfs*18"
+coding_sequence <- get_coding_sequence_from_ensembl(transcript_id)
+mutated_coding_sequence <- apply_mutation(coding_sequence, hgvsc_transformed)
+amino_acid_sequence <- translate_to_amino_acids(mutated_coding_sequence)
+result <- split_sequence(amino_acid_sequence, aa_change_short)
+print(amino_acid_sequence)
+print(paste("Unmutated sequence:", result$unmutated))
+print(paste("Mutated sequence fragment:", result$mutated))
+
+# Para estructura tipo c.X_Yins(nucl); ejemplo 1
+transcript_id <- "ENST00000373631"
+hgvsc_transformed <- "c.3306_3307insA"
+aa_change_short <- "p.C1103Mfs*49"
+coding_sequence <- get_coding_sequence_from_ensembl(transcript_id)
+mutated_coding_sequence <- apply_mutation(coding_sequence, hgvsc_transformed)
+amino_acid_sequence <- translate_to_amino_acids(mutated_coding_sequence)
+result <- split_sequence(amino_acid_sequence, aa_change_short)
+print(amino_acid_sequence)
+print(paste("Unmutated sequence:", result$unmutated))
+print(paste("Mutated sequence fragment:", result$mutated))
+
+# Para estructura tipo c.X_Yins(nucl); ejemplo 2
+transcript_id <- "ENST00000371666"  
+hgvsc_transformed <- "c.388_389insTC" 
+aa_change_short <- "p.T130Ifs*11"
+coding_sequence <- get_coding_sequence_from_ensembl(transcript_id)
+mutated_coding_sequence <- apply_mutation(coding_sequence, hgvsc_transformed)
+amino_acid_sequence <- translate_to_amino_acids(mutated_coding_sequence)
+result <- split_sequence(amino_acid_sequence, aa_change_short)
+print(amino_acid_sequence)
+print(paste("Unmutated sequence:", result$unmutated))
+print(paste("Mutated sequence fragment:", result$mutated))
+
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# CREAMOS UNA FUNCIÓN PARA PROCESAR CADA FILA DE NUESTRA BASE DE DATOS:
+
+# Definimos la función para cada fila:
+process_row <- function(row) {
+  # Accedemos a las variables de interés:
+  transcript_id <- row['transcript_id']
+  hgvsc_transformed <- row['HGVSc_transformed']
+  aa_change_short <- row['aa_change_short']
+  
+  # Creamos un bloque tryCatch para manejar errores durante el procesamiento con la siguiente lógica:
+  tryCatch({
+    # Aplicamos la búsqueda de secuencia codificante de DNA:
+    coding_sequence <- get_coding_sequence_from_ensembl(transcript_id)
+    # Aplicamos la mutación (ya sea duplicación o inserción)
+    mutated_coding_sequence <- apply_mutation(coding_sequence, hgvsc_transformed)
+    # Traducimos la secuencia mutada
+    amino_acid_sequence <- translate_to_amino_acids(mutated_coding_sequence)
+    # Separamos las partes mutada y no mutada
+    result <- split_sequence(amino_acid_sequence, aa_change_short)
+    
+    # Obtenemos las secuencias mutada y no mutada
+    return(c(result$unmutated, result$mutated))
+  }, error = function(e) {
+    # En caso de error el script devolverá un missing value
+    return(c(NA, NA))
+  })
+}
+
+
+# Aplicamos la función sobre cada fila y unimos los resultados de las secuencias en el dataframe original: 
+results <- t(apply(df, 1, process_row))
+df$unmutated_sequence <- results[, 1]
+df$mutated_sequence_fragment <- results[, 2]
+
+View(df)
+
+# Guardamos la información de las secuencias mutadas y no mutadas obtenidas en un archivo .csv:
+write.csv(df, "mers.csv", row.names = FALSE)
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# CHEQUEO DEL FUNCIONAMIENTO SEGÚN RESULTADOS OBTENIDOS EN NUESTRA NUEVA BASE Y AQUELLOS COTEJADOS A MANO DESDE UNIPROT:
+
+# Extraemos los datos para aquella entrada que contenga un transcript_id concreto:
+subset_frameshift_ins <- subset(df, transcript_id == "ENST00000373631")
+
+# Obtenemos las secuencias mutada y no mutada:
+unmutated_sequences <- subset_frameshift_ins$unmutated_sequence
+mutated_sequences <- subset_frameshift_ins$mutated_sequence_fragment
+
+# Imprimimos estas secuencias y las cotejamos con las calculadas a mano desde UniProt para verificar el funcionamiento adecuado del procesamiento:
+print(unmutated_sequences)
+print(mutated_sequences)
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# VALORACIÓN DE PÉRDIDAS (NA) Y ERRORES. ESTE PASO ES EL MISMO CÓDIGO APLICADO A LAS DELECCIONES CON ALTERACIÓN DEL MARCO DE LECTURA (frameshift_del) ya que la alteración a nivel de secuencia proteica es igual y por tanto las premisas para valorar la pérdida, obtener las subsecuencias de 17 aminoácidos y generar el archivo fasta son iguales:
+
+data <- read.csv("mers.csv")
+View(data)
+
+# Primero calculamos el número de transcript_id que no se han hallado en ENSEMBL:
+na_count <- sum(is.na(data$mutated_sequence_fragment))
+
+# Todas las mutaciones con delección y cambio de marco de lectura deben terminar en "*" ya que todas, por definición, introducen un codón de stop prematuro. Por ello aquellas secuencias mutadas que no terminen en "*" son incorrectas, ya sea por acceder a isoformas no canónicas codificantes desde Ensembl u otros errores. Por ello, calculamos el número de seuencias mutadas que no acaban en "*":
+not_ending_with_star_count <- sum(!is.na(data$mutated_sequence_fragment) & !grepl("\\*$", data$mutated_sequence_fragment))
+
+# Dado que solo se produce un codón de stop, aquellas secuencias mutadas con más de un "*" en su secuencia también son erróneas y habrá que eliminarlas. Calculamos cuántas de éstas secuencias hay:
+more_than_one_star_count <- sum(!is.na(data$mutated_sequence_fragment) & grepl("(.*\\*.*){2,}", data$mutated_sequence_fragment))
+
+# Imprimimos resultados:
+cat("Number of NA entries: ", na_count, "\n")
+cat("Number of entries not ending with '*': ", not_ending_with_star_count, "\n")
+cat("Number of entries with more than one '*': ", more_than_one_star_count, "\n")
+
+
+# Filtramos nuestra base de resultados de secuencias y excluimos aquellas entradas falsas por cualquiera de las 3 condiciones mencionadas previamente:
+filtered_data <- data %>%
+  filter(!is.na(mutated_sequence_fragment), # Remove NA values
+         grepl("\\*$", mutated_sequence_fragment), # Ensure it ends with "*"
+         !grepl("(.*\\*.*){2,}", mutated_sequence_fragment)) # Ensure only one "*"
+
+View(filtered_data)
+
+# Guardamos una copia de las secuencias filtradas analizables tras descartar las pérdidas por errores o NA:
+write.csv(filtered_data, "filtered_mutated_sequences.csv", row.names = FALSE)
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# CREAREMOS AHORA SECUENCIAS DE 17 AMINOÁCIDOS CORRESPONDIENTES A LAS SECUENCIAS DE MUTACIÓN OBTENIDAS. ESTE PASO ES EL MISMO CÓDIGO APLICADO A LAS DELECCIONES CON ALTERACIÓN DEL MARCO DE LECTURA (frameshift_del) ya que la alteración a nivel de secuencia proteica es igual y por tanto las premisas para valorar la pérdida, obtener las subsecuencias de 17 aminoácidos y generar el archivo fasta son iguales:
+# Para ello, dado que todos los aminoácidos post_mutación son distintos a los nativos, todas las subsecuencias de 17 aminoácidos pueden ser inmunogénicas. Además cualquier secuencia de 17 aminoácidos que contenga un único aminoácido mutado también tiene potencial inmunogénico. Por ello, lo que haremos será:
+  # Unir los últimos 16 aminoácidos de la secuencia no mutada con todos los aminoácidos de la secuencia mutada (sí la primera secuencia que creemos constará de 16 aminoácidos no mutados y 1 mutado; la segunda constará de 15 aminoácidos no mutados y 2 mutados... y así sucesicamente hasta completar la secuencia combinada completa).
+  # Eliminaresmo el "*" del final de la secuencia combinada para evitar generar una útlima secuencia que contenga dicho elemento. 
+  # Crearemos subsecuencias de 17 aminoácidos a partir de la secuencia combinada completa moviendo una posición hacia adelante cada vez que iteremos.
+
+# FUNCIÓN PARA EXTRAER SECUENCIAS DE 17 AMINOÁCIDOS A PARTIR DE LOS RESULTADOS DE LA MUTACIÓN:
+generate_mers_sequences <- function(unmutated, mutated) {
+  # Eliminammos el carácter "*" de la secuencia mutada:
+  mutated <- gsub("\\*", "", mutated)
+  
+  # Seleccionamos los últimos 16 aminoácidos de la secuencia no mutada si tiene más de 16, de lo contrario seleccionamos toda la secuencia:
+  if (nchar(unmutated) > 16) {
+    unmutated_selected <- substr(unmutated, nchar(unmutated) - 15, nchar(unmutated))
+  } else {
+    unmutated_selected <- unmutated
+  }
+  
+  # Creamos una secuencia combinada uniendo los aminoácidos seleccionados no mutados con los mutados
+  combined_seq <- paste0(unmutated_selected, mutated)
+  
+  # Generamos subsecuencias de 17 aminoácidos de longitud a partir de la secuencia combinada
+  mers_sequences <- list()
+  if (nchar(combined_seq) >= 17) {
+    # Generamos todas las subsecuencias posibles de 17 caracteres de 'combined_seq', comenzando en cada posición hasta que no se pueden extraer más subsecuencias completas.
+    for (i in 1:(nchar(combined_seq) - 16)) {
+      mers_sequences[[i]] <- substr(combined_seq, i, i + 16)
+    }
+  } else {
+    # Si la secuencia combinada es más corta que 17 obtenemos la única secuencia posible:
+    mers_sequences[[1]] <- combined_seq
+  }
+  # Devuelve las subsecuencias peptídicas de 17 aminoácidos seleccionadas:
+  return(mers_sequences)
+}
+
+# Iteramos la función fila por fila de nuestra base de datos:
+expanded_data <- filtered_data %>%
+  rowwise() %>%
+  mutate(mers_sequences = list(generate_mers_sequences(unmutated_sequence, mutated_sequence_fragment))) %>%
+  tidyr::unnest(cols = c(mers_sequences))
+
+# Convertimos 'mers_sequences' en caracteres
+expanded_data$mers_sequences <- as.character(unlist(expanded_data$mers_sequences))
+
+# Convertimos 'expanded_data' en una base de datos para asegurar que todas las columnas sean de tipos estándar y no haya columnas tipo lista:
+expanded_data <- data.frame(expanded_data)
+
+# Verificamos la estructura de 'expanded_data' para comprobar que no haya columnas de tipo lista:
+str(expanded_data)
+View(expanded_data)
+
+# Guardamos los datos en un archivo csv:
+write.csv(expanded_data, "fins_mers.csv", row.names = FALSE)
+
+##---------------------------------------
+##---------------------------------------
+##---------------------------------------
+
+# FINALMENTE CREAMOS UNA ÚLTIMA FUNCIÓN PARA GENERAR UN ARCHIVO .TXT QUE SIGA UN FORMATO FASTA CON EL HEADER QUE EMPIECE POR ">" Y LAS VARIABLES ID (patient_id, sample_id, hugo_symbol y aa_change_short) separadas por "_" y la secuencia mers obtenida para cada mutación. ESTE PASO ES EL MISMO CÓDIGO APLICADO A LAS DELECCIONES CON ALTERACIÓN DEL MARCO DE LECTURA (frameshift_del) ya que la alteración a nivel de secuencia proteica es igual y por tanto las premisas para valorar la pérdida, obtener las subsecuencias de 17 aminoácidos y generar el archivo fasta son iguales:
+
+# FUNCIÓN PARA GENERAR EL ARCHIVO EN FORMATO FASTA:
+generate_fasta_format <- function(df) {
+  # Preparamos un vector para contener todas las cadenas en formato FASTA
+  fasta_lines <- character(nrow(df) * 2) # Especificamos 2 líneas por entrada (header y secuencia)
+  
+  # Iteramos sobre cada fila para crear el formato FASTA
+  for (i in seq_len(nrow(df))) {
+    # Construimos el encabezado FASTA con información de las variables ID separadas por "_":
+    header <- paste(">", df$patient_id[i], df$sample_id[i], df$hugo_symbol[i], df$aa_change_short[i], sep = "_")
+    # Extraemos la secuencia de aminoácidos de la columna 'mers_sequences' de la fila:
+    sequence <- df$mers_sequences[i]
+    # Llenamos las líneas correspondientes de cada entrada: header y secuencia
+    fasta_lines[(i - 1) * 2 + 1] <- header
+    fasta_lines[i * 2] <- sequence
+  }
+  # Obtenemos el vector de líneas, que ahora contiene el encabezado y la secuencia en formato FASTA para cada entrada
+  return(fasta_lines)
+}
+
+# Generamos las líneas en formato FASTA a partir de los datos de nuestra base aplicando la función que acabamos de escribir:
+fasta_content <- generate_fasta_format(expanded_data)
+
+# Especificamos el nombre del archivo para la salida:
+output_filename <- "frame_ins.txt"
+
+# Escribimos el contenido FASTA en el archivo .txt dentro del directorio de trabajo actual
+writeLines(fasta_content, output_filename)
+
+```
