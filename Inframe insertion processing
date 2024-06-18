@@ -1,0 +1,412 @@
+```{r}
+
+if (!requireNamespace("httr", quietly = TRUE)) install.packages("httr")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr")
+
+library(httr)
+library(dplyr)
+library(purrr)
+library(UniProt.ws)
+library(stringr)
+library(tidyr)
+
+setwd("your directory")
+
+df <- read.csv("mutations.csv")
+
+View(df)
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# CREAREMOS EL SCRIPT PARA PROCESAR MUTACIONES DE TIPO INFRAME_INS (sin cambio en marco de lectura). En esto caso, estas mutaciones pueden tomar varias formas que vienen nuevamente especificadas en la estructura de la mutación en la variable 'aa_change_short' pudiendo ser:
+  # DUPLICACIONES SIMPLES O DE RANGO (p.E56dup, p.E56_K61dup): duplicaciones de un único aminoácido especificando el aminoácido y la posición de la duplicación, o de rango, especificando la cadena de aminoácidos (en el caso expuesto, posiciones 56 a 61 ambas incluidas).
+  # INSERCIONES SIMPLES O MÚLTIPLES (p.R45_S46insK, p.R45_S46insKGA): inserciones de un aminoácido o una secuencia de aminoácidos en la posición señalada entre dos aminoácidos de la secuencia. 
+  # DELECCIÓN SEGUIDA DE INSERCIÓN (p.R45delinsK): delección del aminoácido R en 45 e inserción de aminoácido K en dicha posición. 
+# Para poder procesar este tipo de mutaciones la primera función accederá a UniProt. Posteriormente la siguiente función analizará la estructura de la mutación y aplicará la mutación sobre la secuecnia nativa de UniProt en función de su estrcutra definiendo duplicaciones, inserciones y delins. La tercera función separá nuevamente la secuencia completa en la parte previa a la mutación y la secuencia post_mutada que contenga en su inicio la mutación. 
+
+# PRIMERA FUNCIÓN PARA OBTENER LA SECUENCIA NATIVA DE LA PROTEÍNA DESDE UNIPROT A TRAVÉS DE 'hugo_symbol':
+get_protein_sequence_uniprot <- function(gene_name) {
+  # Definimos la URL base para la API de Uniprot.
+  base_url <- "https://rest.uniprot.org/uniprotkb/search?query="
+  # Construimos la consulta específica para buscar secuencias de un gen en el organismo de H. sapiens (id:9606)
+  query <- paste0("gene_exact:", gene_name, " AND organism_id:9606 AND reviewed:true")
+  # Especificamos el formato de respuesta deseado, que en este caso es FASTA.
+  format <- "&format=fasta"
+  # Codificamos la consulta para que pueda ser enviada a través de la URL.
+  encoded_query <- URLencode(query)
+  # Combinamos todo para formar la URL completa.
+  url <- paste0(base_url, encoded_query, format)
+  # Realizamos la petición GET a la URL construida.
+  response <- httr::GET(url)
+  # Chequeamos si el código de estado de la respuesta es 200, lo que indica éxito.
+  if (response$status_code == 200) {
+    # Si la respuesta es exitosa, extraemos el contenido de la respuesta, que debería ser en formato texto.
+    content <- httr::content(response, "text")
+    # Dividimos el contenido del texto por líneas.
+    sequence_lines <- unlist(strsplit(content, "\n"))
+    # Identificamos los índices de las líneas que empiezan con '>', que son los encabezados de las secuencias FASTA.
+    header_indices <- which(grepl("^>", sequence_lines))
+    # Chequeamos si hay al menos una secuencia en la respuesta.
+    if (length(header_indices) >= 1) {
+      # En caso de que haya más de una secuencia, la función tomará solo la primera hasta el inicio de la segunda.
+      if (length(header_indices) > 1) {
+        sequence_lines <- sequence_lines[header_indices[1]:(header_indices[2] - 1)]
+      } else {
+        # En caso de que haya una sola secuencia, la función tomará todo desde el encabezado hasta el final del contenido.
+        sequence_lines <- sequence_lines[header_indices[1]:length(sequence_lines)]
+      }
+      # Filtramos las líneas para quitar el encabezado y unimos las restantes para formar la secuencia completa.
+      sequence <- paste0(sequence_lines[!grepl("^>", sequence_lines)], collapse = "")
+      # La función devuelve la secuencia de proteínas.
+      return(sequence)
+    } else {
+      # Salvo que no se haya encontrado ninguna, en cuyo caso devuelve un missing value:
+      return(NA)
+    }
+  } else {
+    # También devolverá un missing value si la query no fue exitosa (es decir, si el códgio de estado es diferente a 200):
+    return(NA)
+  }
+}
+
+
+# LA SEGUNDA FUNCIÓN ANALIZA LA ESTRUCTURA DE LA MUTACIÓN DECLARADA EN 'aa_change_short' Y EXTRRAE LA INFORMACIÓN NECESARIA INCUYENDO LOS AMINOÁCIDOS, LOCALIZACIÓN Y SECUENCIAS DE INSERCIÓN. POSTERIORMENTE APLICA LA MUTACIÓN SEGÚN LA ESTRCUTURA ENCONTRADA Y DEVUELVE LA SECUENCIA MUTADA:
+apply_mutation <- function(native_sequence, mutation) {
+  # Definimos una expresión regular para identificar las diferentes partes de la cadena de mutación
+  pattern <- "p\\.([A-Z])(\\d+)(?:_([A-Z]*)(\\d+))?(delins|ins|dup)([A-Z]*)"
+  # Ejecutamos la expresión regular sobre la cadena de mutación y almacena los resultados
+  matches <- regmatches(mutation, regexec(pattern, mutation))
+  # Si no se encuentran coincidencias, la función devolverá la secuencia original sin cambios
+  if (length(matches[[1]]) == 0) {
+    return(native_sequence) 
+  }
+  # Extraemos las partes relevantes de la coincidencia de la expresión regular:
+  # Aminoácido en la posición inicial
+  start_aa <- matches[[1]][2]
+  # Posición del aminoácido inicial
+  start_pos <- as.numeric(matches[[1]][3])
+  # Aminoácido en la posición final (si aplica)
+  end_aa <- matches[[1]][4]
+  # Posición final
+  end_pos <- ifelse(nchar(matches[[1]][5]) == 0, start_pos, as.numeric(matches[[1]][5]))
+  # Tipo de mutación (dup, ins, delins)
+  mut_type <- matches[[1]][6]
+  # Secuencia a insertar
+  insert_seq <- matches[[1]][7]
+  
+  # Verificamos si el aminoácido en start_pos es igual al esperado (start_aa)
+  if(substr(native_sequence, start_pos, start_pos) != start_aa) {
+    # Si no coincide, retorna NA indicando un error (control de calidad)
+    return(NA)
+  }
+  # Verificamos si existe una posición y aminoácido final y si coinciden
+  if(end_pos > 0 && nchar(end_aa) > 0) {
+    if(substr(native_sequence, end_pos, end_pos) != end_aa) {
+      # Si no coincide en la posición final, la función devuelve NA
+      return(NA)
+    }
+  }
+  
+  # Aplicaremos ahora la mutación basada en el tipo identificado
+  # Para duplicaciones
+  if (mut_type == "dup") {
+    # Si la posición final es mayor que la inicial entonces estamos ante un rango y se aplica una mutación de rango
+    if (end_pos > start_pos) {
+      # Duplicamos un rango de aminoácidos
+      duplicated_seq <- substr(native_sequence, start_pos, end_pos)
+      mutated_sequence <- paste0(substr(native_sequence, 1, end_pos), duplicated_seq, substr(native_sequence, end_pos + 1, nchar(native_sequence)))
+      # En caso contrario, la única solución posible es la presencia de una duplicación simple en la que la posición final e inicial son iguales.
+    } else {
+      # Por tanto, aplica una duplicación simple:
+      duplicated_seq <- substr(native_sequence, start_pos, start_pos)
+      mutated_sequence <- paste0(substr(native_sequence, 1, start_pos), duplicated_seq, substr(native_sequence, start_pos + 1, nchar(native_sequence)))
+    }
+    # Para inserciones
+  } else if (mut_type == "ins") {
+    # Insertamos la secuencia de aminoácidos en la posición indicada según las posiciones y secuencias definidas previamente en la función:
+    mutated_sequence <- paste0(substr(native_sequence, 1, start_pos), insert_seq, substr(native_sequence, start_pos + 1, nchar(native_sequence)))
+    # En caso de delins mixtos:
+  } else if (mut_type == "delins") {
+    # Reemplazamos una sección de la secuencia con una nueva secuencia
+    mutated_sequence <- paste0(substr(native_sequence, 1, start_pos - 1), insert_seq, substr(native_sequence, end_pos + 1, nchar(native_sequence)))
+    # En caso de que la secuencia no sea válida o haya un error, devolverá la secuencia nativa
+  } else {
+    mutated_sequence <- native_sequence
+  }
+  # La función devolverá la secuencia mutada:
+  return(mutated_sequence)
+}
+
+# LA TERCERA FUNCIÓN SEPARA LAS SECUENCIAS EN SECUENCIA PREVIA A LA MUTACIÓN (pre_mut_seq) Y SECUENCIA POST_MUTADA QUE CONTIENE LOS AMINOÁCIDOS de la mutación:
+split_mutated_sequence <- function(mutated_sequence, mutation) {
+  # Encontramos la posición de la primera mutación utilizando una expresión regular
+  position <- as.numeric(regmatches(mutation, regexec("p\\..(\\d+)", mutation))[[1]][2])
+  # Extraemos la subsecuencia de la secuencia mutada completa que está antes de la mutación (pre_mut)
+  pre_mutation_seq <- substr(mutated_sequence, 1, position - 1)
+  # Extraemos la subsecuencia de la secuencia mutada completa que empieza en la posición de la mutación hasta el final (post_mut)
+  post_mutation_seq <- substr(mutated_sequence, position, nchar(mutated_sequence))
+  # La función devuelve una lista conteniendo las dos subsecuencias
+  return(list(pre_mutation_seq = pre_mutation_seq, post_mutation_seq = post_mutation_seq))
+}
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# CHEQUEAREMOS A MANO MUTACIONES CONCRETAS DE LA BASE DE DATOS PARA VERIFICAR EL FUNCIONAMIENTO DEL SCRIPT:
+
+# EJEMPLO DE CHEQUEO
+gene_name <- "ADRM1"
+mutation <- "p.G392_D393insGHE"
+native_sequence <- get_protein_sequence_uniprot(gene_name)
+mutated_sequence <- apply_mutation(native_sequence, mutation)
+split_sequences <- split_mutated_sequence(mutated_sequence, mutation)
+print(split_sequences)
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# CREAREMOS UNA FUNCIÓN PARA PROCESAR CADA FILA DE NUESTRA BASE DE DATOS CON SUS CORRESPONDIENTES VARIABLES DE INFORMACIÓN ('hugo_symbol' y 'aa_change_short'):
+
+# FUNCIÓN PARA EL PROCESAMIENTO DE CADA FILA DE NUESTRA BASE DE DATOS:
+process_mutation <- function(gene_name, mutation) {
+  # Obtenemos la secuencia nativa con la función definida previamente:
+  original_sequence <- get_protein_sequence_uniprot(gene_name)
+  
+  # Confirmamos que solo proceda si se ha logrado el acceso a una secuencia
+  if (!is.na(original_sequence)) {
+    # Aplicamos la función para analizar la estructura de la mutación y apicarla:
+    mutated_sequence <- apply_mutation(original_sequence, mutation)
+    # Confirmamos que se ha generado una secuencia mutada en cuyo caso procederá a la siguiente orden:
+    if (!is.na(mutated_sequence)) {
+      # Genera las partes pre y pot_mutación:
+      splitted_sequences <- split_mutated_sequence(mutated_sequence, mutation)
+      return(list(pre_mut_seq = splitted_sequences$pre_mutation_seq, post_mut_seq = splitted_sequences$post_mutation_seq))
+    } else {
+      # En caso de fallos a lo largo del script, la función devolverá NA para las secuencias finales
+      return(list(pre_mut_seq = NA, post_mut_seq = NA))
+    }
+  } else {
+    # En caso de fallos a lo largo del script, la función devolverá NA para las secuencias finales
+    return(list(pre_mut_seq = NA, post_mut_seq = NA))
+  }
+}
+
+# Iteramos en nuestra base:
+df <- df %>%
+  rowwise() %>%
+  mutate(processed = list(process_mutation(hugo_symbol, aa_change_short))) %>%
+  ungroup() %>% 
+  mutate(pre_mut_seq = map_chr(processed, ~ .x$pre_mut_seq),
+         post_mut_seq = map_chr(processed, ~ .x$post_mut_seq)) %>%
+  dplyr::select(-processed) 
+
+View(df)
+
+# Guardamos los resultados en un archivo .csv
+write.csv(df, "mers.csv", row.names = FALSE)
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# REALIZAMOS ESTADÍSTICAS BÁSICAS DE PÉRDIDA DE SECUENCIAS POR ERRORES (secuencias no obtenidas desde UniProt)
+
+data <- read.csv("mers.csv")
+
+View(data)
+
+# Calculamos el número de entradas con missing values:
+na_count <- sum(is.na(data$post_mut_seq))
+cat("Number of NA entries: ", na_count, "\n")
+
+# Vamos a filtrar solo por secuencias analizables:
+filtered_data <- data %>%
+  filter(!is.na(post_mut_seq), # Remove NA values
+         !grepl("(.*\\*.*){2,}", post_mut_seq)) # Ensure only one "*"
+
+View(filtered_data)
+
+# Guardamos los datos filtrados en un archivo .csv
+write.csv(filtered_data, "filtered_mutated_sequences.csv", row.names = FALSE)
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+
+# PARA CREAR LAS SUBSECUENCIAS DE 17 AMINOÁCIDOS DONDE LA SECUENCIA MUTADA QUEDE LO MÁS CENTRADA POSIBLE, DADA LA COMPLEJIDAD DE LAS MUTACIONES DE TIPO INFRAME_INS DONDE EL NÚMERO DE AMINOÁCIDOS INTRODUCIDOS ES VARIABLE ES MÁS COMPLEJA. Crearemos una función que:
+  # Defina el tipo de mutación y calcule el número de aminoácidos que componen la mutación (length_mut) (en función si son duplicaciones simples, de rango, inserciones simples o múltiples o delins -delecciones seguidas de inserciones-).
+  # Luego definiremos el número de aminoácidos que seleccionaremos de la secuencia premutada (calc_upst_numb) que será [(17-length_mut)/2] redondeado al número entero más cercano. 
+  # Posteriormente extraeremos la secuencia de aminoácidos upstream (get_ups_seq) que serán los últimos X aminoácidos definidos en calc_upst_numb.
+  # Para calcular el número de aminoácidos que debemos seleccionar de la secuencia post_mutación (calc_down_numb) lo haremos según [17- calc_upst_numb], es decir, 17 menos el número de aminoácidos seleccionados de la secuencia premutada. Una vez conocida la longitud de la secuencia post_mutación, extraeremos la secuencia (get_down_seq).
+  # Finalmente combinaremos las secuencias upstream y downstream  (ups_seq, down_seq) que será nuestra secuencia mers de 17 aminoácidos. 
+
+# FUNCIÓN PARA PROCESAMIENTO DE MUTACIONES:
+calc_mut_length <- function(aa_change_short) {
+  # Si la cadena termina en 'dup', procesamos como duplicación.
+  if (grepl('dup$', aa_change_short)) {
+    # Duplicación de un solo aminoácido.
+    if (grepl('^p\\.\\w\\d+dup$', aa_change_short)) {
+      # Devolverá 2 cuya longitud es el el aminoácido en la posición de la mutación + el insertado (2)
+      return(2)
+    } else if (grepl('^p\\.\\w\\d+_\\w\\d+dup$', aa_change_short)) {
+      # Duplicación de un rango de aminoácidos.
+      numbers <- as.numeric(unlist(regmatches(aa_change_short, gregexpr("\\d+", aa_change_short))))
+      # Si es un rango devuelve 2*(posición max - min +1) como en p.E1_R3 --> son 3 aminoácidos duplicados, 6 en total 2*(3-1+1)=6 
+      return(2 * (numbers[2] - numbers[1] + 1))  # Calcula el total de aminoácidos duplicados.
+    }
+  } else if (grepl('ins', aa_change_short)) {
+    # Caso de inserción.
+    inserted <- sub('.*ins', '', aa_change_short)
+    # Suma 2 más la longitud de la cadena insertada.
+    return(2 + nchar(inserted))  
+  } else if (grepl('delins', aa_change_short)) {
+    # Caso de delección seguida de inserción.
+    inserted <- sub('.*delins', '', aa_change_short)
+    # Retorna la longitud de la inserción (porque resta a 0 la delección simple)
+    return(nchar(inserted))  
+  }
+  # En caso de que no coincida con ningún patrón, retorna 0.
+  return(0)  
+}
+
+# FUNCIÓN PARA CALCULAR EL NÚMERO DE AMINOÁCIDOS QUE NECESITAMOS DE LA SECUENCIA PREMUTACIÓN: 
+calc_upst_numb <- function(length_mut) {
+  # Redondea al número más cercano.
+  round((17 - length_mut) / 2)  
+}
+
+# FUNCIÓN PARA OBTENER LA SECUENCIA UPSTREAM:
+get_ups_seq <- function(pre_mut_seq, upst_numb) {
+  n <- nchar(pre_mut_seq)
+  # Si la secuencia es más corta que la secuencia pre_mutación completa:
+  if (n <= upst_numb) {
+    # La función devuelve toda la secuencia.
+    return(pre_mut_seq)  
+    # Si no
+  } else {
+    # Devuelve la cadena con el número calculado de aminoácidos extraída del final de la secuencia pre_mutada:
+    return(substr(pre_mut_seq, n - upst_numb + 1, n))  # Retorna los últimos 'upst_numb' aminoácidos.
+  }
+}
+
+# FUNCIÓN PARA CALCULAR EL NÚMERO DE AMINOÁCIDOS QUE NECESITAMOS DE LA SECUENCIA POSTMUTACIÓN:.
+calc_down_numb <- function(ups_seq) {
+  # Calcula lo que falta para completar los 17 mers.
+  17 - nchar(ups_seq)  
+}
+
+# FUNCIÓN PARA OBTENER LA SECUENCIA DOWNSTREAM:
+get_down_seq <- function(post_mut_seq, down_numb)
+  n <- nchar(post_mut_seq)
+  # Si la secuencia es más corta 
+  if (n <= down_numb) {
+    # retorna toda la secuencia.
+    return(post_mut_seq)  
+  } else {
+    # Retorna los primeros 'down_numb' aminoácidos.
+    return(substr(post_mut_seq, 1, down_numb))  
+  }
+}
+
+# FUNCIÓN PARA COMBINAR LAS SECUENCIAS UPSTREAM Y DOWNSTREAM PARA GENERAR LAS SECUENCIAS DE 17 AMINOÁCIDOS CON MUTACIÓN CENTRADA:
+create_mers_sequence <- function(ups_seq, down_seq) {
+  paste0(ups_seq, down_seq)  # Combina las dos secuencias en una.
+}
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# CHEQUEO DE LAS FUNCIONES DEFINIDAS:
+
+# Seleccionamos ejemplos de cada tipo de mutación y declaramos la estructura de las secuencias:
+mutations <- c('p.G19_S21dup', 'p.G19dup', 'p.A119_A120insGA', 'p.G19_S21delinsY')
+pre_mut_seq <- "MDPPAGAARRLLCPALLLLLLL"
+post_mut_seq <- "GGAGAAGGAGGAGTYHCNLQAMSLYAAGERGG"
+
+# Procesamos cada ejemplo:
+results <- lapply(mutations, function(mut) {
+  length_mut <- calc_mut_length(mut)
+  upst_numb <- calc_upst_numb(length_mut)
+  ups_seq <- get_ups_seq(pre_mut_seq, upst_numb)
+  down_numb <- calc_down_numb(ups_seq)
+  down_seq <- get_down_seq(post_mut_seq, down_numb)
+  mers_sequence <- create_mers_sequence(ups_seq, down_seq)
+  
+  list(mutation = mut,
+       length_mut = length_mut,
+       upst_numb = upst_numb,
+       ups_seq = ups_seq,
+       down_numb = down_numb,
+       down_seq = down_seq,
+       mers_sequence = mers_sequence)
+})
+
+# Cotejamos resultados:
+print(results)
+
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# PROCESAMIENTO DE LOS DATOS
+
+# AHORA CREAMOS LA FUNCIÓN PARA PROCESAR FILA A FILA NUESTROS DATOS:
+process_mutation <- function(row) {
+  # Extraeremos las variables necesarias para el procesamiento
+  aa_change_short <- row["aa_change_short"]
+  pre_mut_seq <- row["pre_mut_seq"]
+  post_mut_seq <- row["post_mut_seq"]
+  # Aplicamos las funciones definidas:
+  length_mut <- calc_mut_length(aa_change_short)
+  upst_numb <- calc_upst_numb(length_mut)
+  ups_seq <- get_ups_seq(pre_mut_seq, upst_numb)
+  down_numb <- calc_down_numb(ups_seq)
+  down_seq <- get_down_seq(post_mut_seq, down_numb)
+  mers_sequence <- create_mers_sequence(ups_seq, down_seq)
+  # Obtenemos la secuencia mers:
+  return(mers_sequence)
+}
+
+# Iteramos en nuestra base:
+filtered_data$mers_sequence <- apply(filtered_data, 1, process_mutation)
+
+View(filtered_data)
+
+# Guardamos lo datos en un archivo .csv
+write.csv(filtered_data, "inins_mer.csv", row.names = FALSE)
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+# FINALMENTE CREAMOS LA FUNCIÓN PARA GENERAR UN ARCHIVO .TXT EN FORMATO FASTA con header y secuencia:
+
+# DEFINIMOS LA FUNCIÓN PARA PROCESAR CADA FILA Y CREAR EL FASTA FORMAT:
+format_row <- function(row) {
+  # Construimos el header
+  header <- paste(">", row["patient_id"], row["sample_id"], row["hugo_symbol"], row["aa_change_short"], sep="_")
+  # Y la secuencia
+  sequence <- row["mers_sequence"]
+  # Combinamos la unidad header y secuencia en 2 líneas diferentes por entrada:
+  return(c(header, sequence))
+}
+
+# Aplicamos a cada fila de nuestra base de mers:
+formatted_text <- unlist(apply(filtered_data, 1, format_row))
+
+# Guardamos los datos en un archivo .txt que contenga el formato FASTA:
+writeLines(formatted_text, "inins.txt")
+
+#-------------------------------------
+#-------------------------------------
+#-------------------------------------
+
+```
